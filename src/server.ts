@@ -65,10 +65,12 @@ const httpServer = http.createServer(app);
 // -------------------- SERVIDOR DE CHAT SOCKET.IO --------------------
 // Interfaz para tipado de mensajes del chat
 interface ChatMessage {
+    messageId: string; // <-- nuevo
     room: string;
     author: string;
     message: string;
     time: string;
+    // readBy?: string[]; // opcional, si quieres mantenerlo en servidor
 }
 
 // Puerto específico para el servidor de chat
@@ -112,20 +114,87 @@ chatIO.on('connection', (socket) => {
     });
 
     // Manejar evento para unirse a una sala
-    socket.on('join_room', (roomId: string) => {
-        socket.join(roomId);
-        console.log(`Usuario con ID: ${socket.id} se unió a la sala: ${roomId}`);
+    socket.on('join_room', async (data: { room: string; author: string }) => {
+        socket.join(data.room);
+        socket.data.room = data.room;
+        socket.data.author = data.author;
+        // Obtener todos los sockets de la sala
+        const clients = await chatIO.in(data.room).fetchSockets();
+        // Construir objeto users: { [author]: socketId }
+        const users: Record<string, string> = {};
+        clients.forEach(s => {
+            if (s.data.author) {
+                users[s.data.author] = s.id;
+            }
+        });
+        chatIO.in(data.room).emit('online_users', Object.entries(users).map(([username, socketId]) => ({ username, socketId })));
+        chatIO.in(data.room).emit('user_joined', {
+            author: data.author,
+            socketId: socket.id,
+            users
+        });
+        console.log(`Usuario con ID: ${socket.id} se unió a la sala: ${data.room}`);
     });
 
     // Manejar evento para enviar un mensaje
     socket.on('send_message', (data: ChatMessage) => {
-        // Enviar el mensaje solo a los clientes en la misma sala
         socket.to(data.room).emit('receive_message', data);
         console.log(`Mensaje enviado en sala ${data.room} por ${data.author}: ${data.message}`);
     });
 
-    // Manejar desconexión
-    socket.on('disconnect', () => {
+    // Usuario empieza a escribir
+    socket.on('typing', (data: { room: string; author: string }) => {
+        socket.to(data.room).emit('user_typing', data.author);
+    });
+
+    // Usuario deja de escribir
+    socket.on('stop_typing', (data: { room: string; author: string }) => {
+        socket.to(data.room).emit('user_stop_typing', data.author);
+    });
+
+    // Confirmación de lectura
+    socket.on('message_read', (data: { room: string; messageId: string; reader: string }) => {
+        socket.to(data.room).emit('update_read_receipts', {
+            messageId: data.messageId,
+            reader: data.reader
+        });
+    });
+
+    // Mensajes privados (“whispers”)
+    // El cliente debe enviar: { toSocketId, message: ChatMessage }
+    socket.on('private_message', (data: { toSocketId: string; message: ChatMessage }) => {
+        socket.to(data.toSocketId).emit('receive_private_message', data.message);
+    });
+
+    // Reacciones en mensajes
+    // Cliente emite: { room, messageId, emoji, reactor }
+    socket.on('react_message', (data: { room: string; messageId: string; emoji: string; reactor: string }) => {
+        socket.to(data.room).emit('update_reactions', {
+            messageId: data.messageId,
+            emoji: data.emoji,
+            reactor: data.reactor
+        });
+    });
+
+    // Notificación de desconexión
+    socket.on('disconnect', async () => {
+        const { room, author } = socket.data as { room?: string; author?: string };
+        if (room) {
+            // Recalcula la lista de usuarios conectados
+            const clients = await chatIO.in(room).fetchSockets();
+            // Construir objeto users: { [author]: socketId }
+            const users: Record<string, string> = {};
+            clients.forEach(s => {
+                if (s.data.author) {
+                    users[s.data.author] = s.id;
+                }
+            });
+            chatIO.in(room).emit('online_users', Object.entries(users).map(([username, socketId]) => ({ username, socketId })));
+            chatIO.in(room).emit('user_left', {
+                author,
+                users
+            });
+        }
         console.log(`Usuario desconectado del chat: ${socket.id}`);
     });
 });
